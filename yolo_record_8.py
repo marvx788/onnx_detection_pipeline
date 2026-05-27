@@ -10,6 +10,8 @@ Boxes are perfectly synchronized with objects, no risk of mismatch or drift.
 If the AI becomes slower than the source, an automatic fallback uses
 the last known detection plus anti-flicker hysteresis.
 
+Encode thread is separated from display thread to avoid push-buffer blocking.
+
 """
 
 import sys
@@ -27,7 +29,7 @@ gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib
 
 import matplotlib
-matplotlib.use('Agg')  # backend sans GUI
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 try:
@@ -99,7 +101,7 @@ class YoloInference:
         self._lock       = threading.Lock()
         self._count      = 0
         self._sum_ms     = 0.0
-        self._recent_ms  = deque(maxlen=SMOOTH_WIN)  # fenêtre glissante
+        self._recent_ms  = deque(maxlen=SMOOTH_WIN)
 
     def infer(self, frame_bgr):
         h, w    = frame_bgr.shape[:2]
@@ -148,12 +150,12 @@ class YoloInference:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
 
     def avg_fps(self):
-        """FPS moyen global (pour affichage OSD sur la vidéo)."""
+        """FPS moyen global (OSD vidéo)."""
         with self._lock:
             return 1000.0 / (self._sum_ms / self._count) if self._count > 0 else 0.0
 
     def recent_fps(self):
-        """FPS lissé sur la fenêtre glissante (pour le graphique)."""
+        """FPS lissé sur fenêtre glissante (graphique)."""
         with self._lock:
             if not self._recent_ms:
                 return 0.0
@@ -165,7 +167,7 @@ class YoloInference:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tracker hysteresis (anti-clignotement, utilise en mode fallback)
+#  Tracker hysteresis
 # ─────────────────────────────────────────────────────────────────────────────
 def iou(b1, b2):
     ix1=max(b1[0],b2[0]); iy1=max(b1[1],b2[1])
@@ -250,10 +252,9 @@ def get_best_device():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Graphique FPS (fenêtres glissantes → courbes lisses)
+#  Graphique FPS
 # ─────────────────────────────────────────────────────────────────────────────
 def save_fps_graph(stats, output_path, source_fps):
-    """Génère un graphique FPS à 3 sous-graphiques similaire au benchmark."""
     ids = stats["frame_ids"]
     if not ids:
         print("  [WARN] Aucune donnée FPS collectée — graphique ignoré")
@@ -317,6 +318,8 @@ def run(video_path, model_path, output_path):
 
     # ── Queues ───────────────────────────────────────────────────────────────
     infer_q  = queue.Queue(maxsize=4)
+    # encode_q découple display_thread du push-buffer bloquant de x264enc
+    encode_q = queue.Queue(maxsize=8)
     src_eos  = threading.Event()
     stop_evt = threading.Event()
     stats    = {
@@ -324,7 +327,6 @@ def run(video_path, model_path, output_path):
         "sync_hits":     0,
         "sync_miss":     0,
         "t0":            None,
-        # ── Métriques graphique ──────────────────────────────────────────────
         "frame_ids":     [],
         "ai_fps_hist":   [],
         "pipe_fps_hist": [],
@@ -333,11 +335,11 @@ def run(video_path, model_path, output_path):
         "_last_disp_t":  None,
     }
 
-    # ── Fenêtres glissantes locales au display_thread ────────────────────────
+    # Fenêtres glissantes pour lissage FPS
     pipe_fps_window = deque(maxlen=SMOOTH_WIN)
     disp_fps_window = deque(maxlen=SMOOTH_WIN)
 
-    # ── Destination pipeline EOS event ──────────────────────────────────────
+    # ── Destination pipeline EOS ─────────────────────────────────────────────
     dst_eos_evt = threading.Event()
 
     # ── Destination pipeline ─────────────────────────────────────────────────
@@ -426,6 +428,33 @@ def run(video_path, model_path, output_path):
                     del result_map[oldest]
             result_evt.set()
 
+    # ── Encode thread ─────────────────────────────────────────────────────────
+    # Séparé de display_thread pour ne plus être bloqué par x264enc.
+    # display_thread dépose (bytes, frame_idx) dans encode_q et continue
+    # immédiatement ; encode_thread fait le push-buffer bloquant de son côté.
+    encode_done = threading.Event()
+    def encode_thread():
+        while True:
+            item = encode_q.get()
+            if item is None:
+                break
+            data, idx = item
+
+            # Log diagnostic : détecte si x264enc bloque trop longtemps
+            t_push = time.perf_counter()
+            pts = idx * frame_duration_ns
+            buf = Gst.Buffer.new_wrapped(data)
+            buf.pts      = pts
+            buf.dts      = pts
+            buf.duration = frame_duration_ns
+            appsrc.emit("push-buffer", buf)
+            push_ms = (time.perf_counter() - t_push) * 1000
+            if push_ms > 40:
+                print(f"\n  [WARN] push-buffer lent : {push_ms:.0f}ms (frame {idx})")
+
+        appsrc.emit("end-of-stream")
+        encode_done.set()
+
     # ── Display thread ────────────────────────────────────────────────────────
     display_done = threading.Event()
     def display_thread():
@@ -434,7 +463,10 @@ def run(video_path, model_path, output_path):
 
         while True:
             item = display_q.get()
-            if item is None: break
+            if item is None:
+                # Fin du stream : signaler encode_thread puis sortir
+                encode_q.put(None)
+                break
             frame, fidx = item
 
             # Attente du résultat IA pour cette frame précise
@@ -456,14 +488,14 @@ def run(video_path, model_path, output_path):
 
             ai.draw(frame, last_dets)
 
-            # ── Pipeline FPS lissé ───────────────────────────────────────────
+            # ── Métriques Pipeline FPS (avant dépôt encode_q) ────────────────
             now = time.perf_counter()
             if stats["_last_pipe_t"] is not None:
                 pipe_fps_window.append(1.0 / max(1e-9, now - stats["_last_pipe_t"]))
             stats["_last_pipe_t"] = now
             pipe_fps = sum(pipe_fps_window) / len(pipe_fps_window) if pipe_fps_window else 0.0
 
-            # ── OSD sur la vidéo (utilise avg_fps global, stable) ────────────
+            # OSD sur la vidéo
             ai_fps_osd = ai.avg_fps()
             sync_r     = stats["sync_hits"] / max(1, stats["sync_hits"] + stats["sync_miss"])
             txt        = f"AI: {ai_fps_osd:.1f} fps  sync:{sync_r*100:.0f}%"
@@ -472,27 +504,22 @@ def run(video_path, model_path, output_path):
             cv2.putText(frame, txt, (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,220,80), 2)
 
-            pts          = out_idx * frame_duration_ns
-            buf          = Gst.Buffer.new_wrapped(frame.tobytes())
-            buf.pts      = pts
-            buf.dts      = pts
-            buf.duration = frame_duration_ns
-            appsrc.emit("push-buffer", buf)
+            # Dépôt non-bloquant dans encode_q → display_thread ne patiente
+            # plus sur x264enc
+            encode_q.put((frame.tobytes(), out_idx))
 
             stats["written"] += 1
             out_idx += 1
 
-            # ── Display FPS lissé ────────────────────────────────────────────
+            # ── Métriques Display FPS (après dépôt encode_q) ─────────────────
             disp_now = time.perf_counter()
             if stats["_last_disp_t"] is not None:
                 disp_fps_window.append(1.0 / max(1e-9, disp_now - stats["_last_disp_t"]))
             stats["_last_disp_t"] = disp_now
             disp_fps = sum(disp_fps_window) / len(disp_fps_window) if disp_fps_window else 0.0
 
-            # ── AI FPS lissé (fenêtre glissante via recent_fps) ─────────────
             ai_fps_graph = ai.recent_fps()
 
-            # Enregistrement des métriques lissées pour le graphique
             stats["frame_ids"].append(stats["written"])
             stats["ai_fps_hist"].append(ai_fps_graph)
             stats["pipe_fps_hist"].append(pipe_fps)
@@ -509,7 +536,6 @@ def run(video_path, model_path, output_path):
                   f"  vitesse:{speed:.1f}x",
                   end="", flush=True)
 
-        appsrc.emit("end-of-stream")
         display_done.set()
 
     # ── Demarrage ─────────────────────────────────────────────────────────────
@@ -521,8 +547,10 @@ def run(video_path, model_path, output_path):
 
     t_ai   = threading.Thread(target=ai_thread,      daemon=True)
     t_disp = threading.Thread(target=display_thread, daemon=True)
+    t_enc  = threading.Thread(target=encode_thread,  daemon=True)
     t_ai.start()
     t_disp.start()
+    t_enc.start()
 
     loop        = GLib.MainLoop()
     loop_thread = threading.Thread(target=loop.run, daemon=True)
@@ -531,6 +559,7 @@ def run(video_path, model_path, output_path):
     try:
         src_eos.wait()
         display_done.wait(timeout=60)
+        encode_done.wait(timeout=60)
         print("\n  Attente finalisation mp4mux...")
         if not dst_eos_evt.wait(timeout=30):
             print("  [WARN] Timeout EOS destination — le fichier pourrait etre incomplet")
@@ -557,7 +586,6 @@ def run(video_path, model_path, output_path):
     print(f"  Fallback        : {stats['sync_miss']}")
     print(f"  Temps total     : {elapsed:.1f}s\n")
 
-    # ── Génération du graphique FPS ──────────────────────────────────────────
     save_fps_graph(stats, output_path, fps)
 
     return True
