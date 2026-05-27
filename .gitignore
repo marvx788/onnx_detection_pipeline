@@ -1,0 +1,8 @@
+# Modèles YOLO (PyTorch, ONNX, OpenVINO)
+*.onnx
+*.pt
+*_openvino_model/
+
+# Dossier de compilation C++ / GStreamer
+build/
+gst-template/
