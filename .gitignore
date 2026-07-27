@@ -2,7 +2,8 @@
 *.onnx
 *.pt
 *_openvino_model/
+*.mp4
+*.png
 
 # Dossier de compilation C++ / GStreamer
-build/
 gst-template/   

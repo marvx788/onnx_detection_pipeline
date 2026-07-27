@@ -25,8 +25,8 @@ gi.require_version('GLib', '2.0')
 from gi.repository import Gst, GLib
 
 # === CONFIGURATION ===
-BASE_DIR       = "/home/marvin/Documents/onnx_detection/onnx_detection_gpu"
-DEFAULT_VIDEO  = f"{BASE_DIR}/build/test-video_6.mp4"
+BASE_DIR       = "/home/comvis/Documents/onnx_detection_pipeline"
+DEFAULT_VIDEO  = f"{BASE_DIR}/test-video.mp4"
 DEFAULT_MODEL  = f"{BASE_DIR}/yolo11n.onnx"
 DEFAULT_OUTPUT = f"{BASE_DIR}/output_mc.mp4"
 PLUGIN_PATH    = f"{BASE_DIR}/gst-template/builddir/gst-plugin" 

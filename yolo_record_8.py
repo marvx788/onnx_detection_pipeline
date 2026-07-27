@@ -43,14 +43,14 @@ except ImportError:
     print("[ERREUR] pip install openvino"); sys.exit(1)
 
 # === CONFIGURATION ===
-BASE_DIR       = "/home/marvin/Documents/onnx_detection/onnx_detection_gpu"
-DEFAULT_VIDEO  = f"{BASE_DIR}/build/test-video_2.mp4"
-DEFAULT_MODEL  = f"{BASE_DIR}/yolo11n.onnx"
-DEFAULT_OUTPUT = f"{BASE_DIR}/output_vino.mp4"
+BASE_DIR       = "/home/comvis/Documents/onnx_detection_pipeline"
+DEFAULT_VIDEO  = f"{BASE_DIR}/test_video_4_rognee.mp4"
+DEFAULT_MODEL  = f"{BASE_DIR}/yolo11n_320.onnx"
+DEFAULT_OUTPUT = f"{BASE_DIR}/output_320.mp4"
 PLUGIN_PATH    = f"{BASE_DIR}/gst-template/builddir/gst-plugin"
 ONNX_LIB_PATH  = "/opt/onnxruntime/lib"
 
-INPUT_SIZE  = 640
+INPUT_SIZE  = 320
 H264_QP     = 20
 
 # ── Anti-flicker thresholds ──────────────────────────────────────────────────
@@ -60,10 +60,10 @@ NMS_THRESHOLD      = 0.45
 MAX_MISSING_FRAMES = 3
 
 # ── Timeout for sequential mode ─────────────────────────────────────────────
-SYNC_TIMEOUT_MS = 80   # ~2 frames at 25fps
+SYNC_TIMEOUT_MS = 400
 
 # ── Lissage graphique ────────────────────────────────────────────────────────
-SMOOTH_WIN = 30   # fenêtre glissante en frames (~1s à 25fps)
+SMOOTH_WIN = 30
 
 os.environ["GST_PLUGIN_PATH"] = PLUGIN_PATH
 os.environ["LD_LIBRARY_PATH"] = ONNX_LIB_PATH + ":" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -242,11 +242,11 @@ def get_video_info(path):
 def get_best_device():
     ie = Core()
     available = ie.available_devices
-    print(f"  Devices disponibles : {available}")
+    print(f"  Devices available: {available}")
     priority = ["GPU", "CPU"]
     for device in priority:
         if device in available:
-            print(f"  Device sélectionné  : {device}")
+            print(f"  Device sélected  : {device}")
             return device
     return "CPU"
 
@@ -257,7 +257,7 @@ def get_best_device():
 def save_fps_graph(stats, output_path, source_fps):
     ids = stats["frame_ids"]
     if not ids:
-        print("  [WARN] Aucune donnée FPS collectée — graphique ignoré")
+        print("  [WARN] No FPS data collected — graphic ignored")
         return
 
     graph_path = os.path.splitext(output_path)[0] + "_fps_graph.png"
@@ -298,16 +298,16 @@ def run(video_path, model_path, output_path):
     frame_duration_ns = int(round(Gst.SECOND / fps))
 
     print("=" * 60)
-    print("  YOLO — Traitement sequentiel (boites synchrones)")
+    print("  YOLO — Sequential processing ")
     print("=" * 60)
-    print(f"  Entree      : {video_path}")
-    print(f"  Modele      : {model_path}")
-    print(f"  Sortie      : {output_path}")
+    print(f"  Input      : {video_path}")
+    print(f"  Model      : {model_path}")
+    print(f"  Output      : {output_path}")
     print(f"  Dims        : {width}x{height} @ {fps}fps  ({total} frames)")
-    print(f"  Timeout sync: {SYNC_TIMEOUT_MS}ms (fallback si IA trop lente)")
+    print(f"  Timeout sync: {SYNC_TIMEOUT_MS}ms (fallback if AI is to slow)")
     print(f"  Lissage FPS : fenêtre de {SMOOTH_WIN} frames")
     print("=" * 60)
-    print("  Chargement modele ONNX...")
+    print("  Charging modele ONNX...")
     ai      = YoloInference(model_path)
     tracker = HysteresisTracker()
 
@@ -318,7 +318,6 @@ def run(video_path, model_path, output_path):
 
     # ── Queues ───────────────────────────────────────────────────────────────
     infer_q  = queue.Queue(maxsize=4)
-    # encode_q découple display_thread du push-buffer bloquant de x264enc
     encode_q = queue.Queue(maxsize=8)
     src_eos  = threading.Event()
     stop_evt = threading.Event()
@@ -429,9 +428,6 @@ def run(video_path, model_path, output_path):
             result_evt.set()
 
     # ── Encode thread ─────────────────────────────────────────────────────────
-    # Séparé de display_thread pour ne plus être bloqué par x264enc.
-    # display_thread dépose (bytes, frame_idx) dans encode_q et continue
-    # immédiatement ; encode_thread fait le push-buffer bloquant de son côté.
     encode_done = threading.Event()
     def encode_thread():
         while True:
@@ -464,12 +460,11 @@ def run(video_path, model_path, output_path):
         while True:
             item = display_q.get()
             if item is None:
-                # Fin du stream : signaler encode_thread puis sortir
                 encode_q.put(None)
                 break
             frame, fidx = item
 
-            # Attente du résultat IA pour cette frame précise
+            # Waiting for the AI result for this frame
             deadline = time.perf_counter() + SYNC_TIMEOUT_MS / 1000.0
             dets = None
             while time.perf_counter() < deadline:
@@ -538,8 +533,8 @@ def run(video_path, model_path, output_path):
 
         display_done.set()
 
-    # ── Demarrage ─────────────────────────────────────────────────────────────
-    print("  Traitement...\n")
+    # ── Running ─────────────────────────────────────────────────────────────
+    print("  Processing...\n")
     stats["t0"] = time.monotonic()
 
     dst_pipeline.set_state(Gst.State.PLAYING)
@@ -560,12 +555,12 @@ def run(video_path, model_path, output_path):
         src_eos.wait()
         display_done.wait(timeout=60)
         encode_done.wait(timeout=60)
-        print("\n  Attente finalisation mp4mux...")
+        print("\n  Waiting finalisation mp4mux...")
         if not dst_eos_evt.wait(timeout=30):
-            print("  [WARN] Timeout EOS destination — le fichier pourrait etre incomplet")
+            print("  [WARN] Timeout EOS destination — the file could be incomplete")
 
     except KeyboardInterrupt:
-        print("\n  Interrompu.")
+        print("\n  Interrupted.")
         display_q.put(None)
 
     stop_evt.set()
@@ -578,13 +573,13 @@ def run(video_path, model_path, output_path):
 
     elapsed = time.monotonic() - stats["t0"]
     sync_r  = stats["sync_hits"] / max(1, stats["sync_hits"]+stats["sync_miss"])
-    print(f"\n\n  Termine ! → {output_path}")
-    print(f"  Frames ecrites  : {stats['written']}/{total}")
+    print(f"\n\n  Finish !    → {output_path}")
+    print(f"  Frames written  : {stats['written']}/{total}")
     print(f"  Frames IA       : {ai.count()}")
-    print(f"  FPS IA moyen    : {ai.avg_fps():.1f}")
-    print(f"  Sync reussies   : {stats['sync_hits']} ({sync_r*100:.0f}%)")
+    print(f"  FPS AI average  : {ai.avg_fps():.1f}")
+    print(f"  Sync succeded   : {stats['sync_hits']} ({sync_r*100:.0f}%)")
     print(f"  Fallback        : {stats['sync_miss']}")
-    print(f"  Temps total     : {elapsed:.1f}s\n")
+    print(f"  Total time      : {elapsed:.1f}s\n")
 
     save_fps_graph(stats, output_path, fps)
 
@@ -614,7 +609,7 @@ if __name__ == "__main__":
         output = args[0] if args else DEFAULT_OUTPUT
         video  = args[1] if len(args) > 1 else DEFAULT_VIDEO
         if not os.path.exists(video):
-            print(f"[ERREUR] Video introuvable : {video}"); sys.exit(1)
+            print(f"[ERREUR] Unable to locate video : {video}"); sys.exit(1)
         if not os.path.exists(DEFAULT_MODEL):
-            print(f"[ERREUR] Modele introuvable : {DEFAULT_MODEL}"); sys.exit(1)
+            print(f"[ERREUR] Unable to locate model : {DEFAULT_MODEL}"); sys.exit(1)
         run(video, DEFAULT_MODEL, output)

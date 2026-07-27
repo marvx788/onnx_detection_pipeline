@@ -35,15 +35,15 @@ except ImportError:
     print("[ERREUR] pip install onnxruntime"); sys.exit(1)
 
 # === CONFIGURATION ===
-BASE_DIR       = "/home/marvin/Documents/onnx_detection/onnx_detection_gpu"
-DEFAULT_VIDEO  = f"{BASE_DIR}/build/test_video_3_fixed.mp4"
+BASE_DIR       = "/home/comvis/Documents/onnx_detection_pipeline"
+DEFAULT_VIDEO  = f"{BASE_DIR}/test-video.mp4"
 DEFAULT_MODEL  = f"{BASE_DIR}/yolo11n_320.onnx"
 DEFAULT_OUTPUT = f"{BASE_DIR}/output_low_px.mp4"
 PLUGIN_PATH    = f"{BASE_DIR}/gst-template/builddir/gst-plugin"
 ONNX_LIB_PATH  = "/opt/onnxruntime/lib"
 
 CPU_THREADS = 4
-INPUT_SIZE  = 320   # changer en 640 si modele 640
+INPUT_SIZE  = 320
 H264_QP     = 20
 
 # ── Anti-flicker thresholds ──────────────────────────────────────────────────
@@ -55,7 +55,7 @@ MAX_MISSING_FRAMES = 3
 # ── Timeout for sequential mode ─────────────────────────────────────────────
 # If the AI does not respond within SYNC_TIMEOUT_MS, use the last detection
 # Set to 0 to always wait (risk of hang if the AI is too slow)
-SYNC_TIMEOUT_MS = 80   # ~2 frames at 25fps
+SYNC_TIMEOUT_MS = 400
 
 os.environ["GST_PLUGIN_PATH"] = PLUGIN_PATH
 os.environ["LD_LIBRARY_PATH"] = ONNX_LIB_PATH + ":" + os.environ.get("LD_LIBRARY_PATH", "")
