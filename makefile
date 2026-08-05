@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────
 
 CXX    = g++
-TARGET = yolo_pipeline_bee
+TARGET = yolo_pipeline
 
 CXXFLAGS = -O2 -march=native -std=c++11 -Wall -Wextra \
            -ffast-math -funroll-loops
@@ -35,7 +35,7 @@ ALL_LIBS     = $(OPENCV_LIBS) $(OV_LIBS) $(EXTRA_LIBS)
 all: $(TARGET)
 	@echo "✓  Build réussi : ./$(TARGET)"
 
-$(TARGET): yolo_pipeline_bee.cpp
+$(TARGET): yolo_pipeline.cpp
 	$(CXX) $(ALL_CXXFLAGS) $< -o $@ $(ALL_LIBS)
 
 clean:

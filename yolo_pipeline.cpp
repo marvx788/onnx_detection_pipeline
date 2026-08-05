@@ -1,13 +1,19 @@
 /*
- * YOLO Detection — MJPEG Stream + Forward Temporal Prediction
- * Traduction C++11 (OpenCV 4.x + OpenVINO C API)
+ * YOLO Detection — MJPEG Stream + Frame-by-Frame Kinematic Predictor
+ * Optimized for Raspberry Pi 4 (OpenCV 4.x + OpenVINO C API)
  *
- * OpenCV 4.x a supprimé l'API C pure (IplImage, cvResize…).
- * On utilise cv::Mat / l'API C++ moderne tout en gardant
- * le reste de la logique identique au Python v6.1.
+ * Principle:
+ *   - Inference runs in the background at a variable rate (adaptive skip)
+ *   - Once inference has produced >= 2 detections for an object, we compute
+ *     velocity V = (pos_n - pos_{n-1}) / DeltaT
+ *     where DeltaT = n_frames_elapsed * (1/DISPLAY_FPS)
+ *   - Each display frame is BLANK: the prediction is recomputed from the
+ *     last inference result: pos = pos_n + V * k * dt_display
+ *     with k = number of frames since the last inference result
+ *   - NO persistence of predictions between frames
+ *   - The tracker is only used for inference->object matching (stable ID)
  */
 
-/* _GNU_SOURCE défini par g++ automatiquement */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +26,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <atomic>
 
 #include <pthread.h>
 #include <unistd.h>
@@ -37,33 +44,48 @@
 /* OpenVINO C API */
 #include <openvino/c/openvino.h>
 
+/* Set to 1 to enable profiling instrumentation */
+#define ENABLE_PROFILING 1
+
 /* ─── CONFIGURATION ──────────────────────────────────────────────────────── */
 #define BASE_DIR       "/home/comvis/Documents/onnx_detection_pipeline"
 static const char *DEFAULT_VIDEO = BASE_DIR "/test-video.mp4";
 static const char *DEFAULT_MODEL = BASE_DIR "/yolo11n_256.onnx";
 
 static const int    INPUT_SIZE      = 256;
-static const float  DISPLAY_SCALE  = 0.75f;
+
+/*
+ * DISPLAY_SCALE is fixed at 1.0: the display frame is no longer resized
+ * (see run_pipeline). It still exists because it scales detection boxes
+ * in ai_thread_fn — at 1.0f this is a no-op, keeping boxes aligned with
+ * the unscaled source frame sent to the MJPEG stream.
+ */
+static const float  DISPLAY_SCALE  = 1.0f;
 static const int    JPEG_QUALITY   = 70;
 static const int    HTTP_PORT      = 8080;
 
 static const float  CONF_KEEP      = 0.25f;
 static const float  NMS_THRESHOLD  = 0.45f;
 
-static const char  *RECORD_OUTPUT  = "output_compensation.mp4";
-static const double RECORD_FPS     = 12.5;
+static const double DISPLAY_FPS    = 25.0;   // FIXED DISPLAY FPS
+static const double DT_DISPLAY      = 1.0 / DISPLAY_FPS; // duration of one display frame
 
-static const bool   MC_ENABLED         = true;
-static const double MC_MAX_PREDICT_MS  = 500.0;
-static const float  MC_DECAY_CONF      = 0.02f;
-static const float  MC_MIN_CONF        = 0.10f;
-static const float  MC_IOU_MATCH       = 0.30f;
+/* Tracking / kinematic prediction */
+static const float  MC_IOU_MATCH       = 0.25f;
+static const int    TRACKER_MAX_AGE    = 3;    // missed inference frames before removal
+
+/* Exponential smoothing for box sizes (avoids drastic jumps) */
+static const float  SIZE_EMA_ALPHA     = 0.3f;
 
 static const int    MAX_OBJECTS    = 64;
-static const int    MAX_DETECTIONS = 64;
 static const int    MAX_CLASSES    = 80;
 
-/* ─── CLASSES COCO ───────────────────────────────────────────────────────── */
+/* Adaptive inference skip */
+static const double TARGET_AI_MS   = 120.0;
+static const int    MAX_SKIP       = 8;
+static const double AI_EMA_ALPHA   = 0.2;
+
+/* ─── COCO CLASSES ───────────────────────────────────────────────────────── */
 static const char *COCO_CLASSES[80] = {
     "person","bicycle","car","motorcycle","airplane","bus","train","truck",
     "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
@@ -93,7 +115,7 @@ static void init_colors() {
     }
 }
 
-/* ─── UTILITAIRES TEMPS ──────────────────────────────────────────────────── */
+/* ─── TIME UTILITIES ─────────────────────────────────────────────────────── */
 static double perf_counter() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -108,24 +130,48 @@ static void sleep_sec(double s) {
     nanosleep(&ts, NULL);
 }
 
-/* ─── TYPES DÉTECTION / TRACKING ────────────────────────────────────────── */
+/*
+ * Adaptive skip, lock-free.
+ * update() is only called by the inference thread (sole writer of
+ * ai_ms_ema and current_skip). should_process() is only called by the
+ * main thread (sole writer of frame_counter). Since no field ever has
+ * two concurrent writers, relaxed atomics are sufficient here.
+ */
+struct AdaptiveSkip {
+    std::atomic<double> ai_ms_ema{100.0};
+    std::atomic<int>    current_skip{1};
+    std::atomic<int>    frame_counter{0};
+
+    void update(double ai_ms) {
+        double old_ema = ai_ms_ema.load(std::memory_order_relaxed);
+        double new_ema = AI_EMA_ALPHA * ai_ms + (1.0 - AI_EMA_ALPHA) * old_ema;
+        ai_ms_ema.store(new_ema, std::memory_order_relaxed);
+
+        double ideal_skip = new_ema * DISPLAY_FPS / 1000.0;
+        int skip = std::max(1, std::min(MAX_SKIP, (int)std::ceil(ideal_skip)));
+        current_skip.store(skip, std::memory_order_relaxed);
+    }
+
+    bool should_process() {
+        int skip = current_skip.load(std::memory_order_relaxed);
+        int fc = frame_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (fc >= skip) {
+            frame_counter.store(0, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    int get_skip() { return current_skip.load(std::memory_order_relaxed); }
+};
+
+/* ─── DETECTION TYPES ────────────────────────────────────────────────────── */
 struct Box { float x, y, w, h; };
 
 struct Detection {
     Box   box;
     float conf;
     int   cls_id;
-};
-
-struct TrackedObject {
-    int    id, cls_id;
-    Box    box, box_ia;
-    float  conf, conf_ia;
-    double t_capture;
-    float  vx_ps, vy_ps, vw_ps, vh_ps;
-    double last_update;
-    int    frames_since_ia, age;
-    cv::Scalar color;
 };
 
 /* ─── NMS ────────────────────────────────────────────────────────────────── */
@@ -155,14 +201,129 @@ static int nms_detections(std::vector<Detection> &dets, float thresh) {
     return (int)dets.size();
 }
 
-/* ─── TRACKER ────────────────────────────────────────────────────────────── */
+/*
+ * FRAME-BY-FRAME KINEMATIC PREDICTOR — scale-factor corrected.
+ * Velocity is only recomputed on a new inference result via push();
+ * the display frame just does a few multiply/adds in predict().
+ */
+struct KinState {
+    float cx_cur, cy_cur, w_cur, h_cur;
+    float conf_cur;
+    int   frame_idx_cur;
+
+    float cx_prev, cy_prev, w_prev, h_prev;
+    int   frame_idx_prev;
+
+    float L_cur  = 0.0f;
+    float L_prev = 0.0f;
+
+    bool has_two = false;
+    bool initialized = false;
+
+    float w_smooth = 0, h_smooth = 0;
+    bool  smooth_init = false;
+
+    void push(const Box &b, float conf, int frame_idx) {
+        if (!smooth_init) {
+            w_smooth = b.w;
+            h_smooth = b.h;
+            smooth_init = true;
+        } else {
+            w_smooth = SIZE_EMA_ALPHA * b.w + (1.0f - SIZE_EMA_ALPHA) * w_smooth;
+            h_smooth = SIZE_EMA_ALPHA * b.h + (1.0f - SIZE_EMA_ALPHA) * h_smooth;
+        }
+
+        float L_new = sqrtf(w_smooth * h_smooth);
+
+        if (!initialized) {
+            cx_cur = b.x + b.w/2;
+            cy_cur = b.y + b.h/2;
+            w_cur  = w_smooth;
+            h_cur  = h_smooth;
+            conf_cur = conf;
+            frame_idx_cur = frame_idx;
+            L_cur = L_new;
+            initialized = true;
+        } else {
+            cx_prev = cx_cur; cy_prev = cy_cur;
+            w_prev  = w_cur;  h_prev  = h_cur;
+            frame_idx_prev = frame_idx_cur;
+            L_prev = L_cur;
+
+            cx_cur = b.x + b.w/2;
+            cy_cur = b.y + b.h/2;
+            w_cur  = w_smooth;
+            h_cur  = h_smooth;
+            conf_cur = conf;
+            frame_idx_cur = frame_idx;
+            L_cur = L_new;
+            has_two = true;
+        }
+    }
+
+    bool predict(int frame_idx_now, Box &out_box, float &out_conf) const {
+        if (!has_two)
+            return false;
+
+        int delta_frames = frame_idx_cur - frame_idx_prev;
+        if (delta_frames < 1)
+            delta_frames = 1;
+
+        int k = frame_idx_now - frame_idx_cur;
+        if (k < 0)
+            k = 0;
+
+        if (k > delta_frames * 2)
+            return false;
+
+        float scale_factor = 1.0f;
+        if (L_prev > 1e-6f && L_cur > 1e-6f) {
+            scale_factor = L_cur / L_prev;
+            scale_factor = std::max(0.5f, std::min(2.0f, scale_factor));
+        }
+
+        float DeltaT = delta_frames / (float)DISPLAY_FPS;
+        float dt = k / (float)DISPLAY_FPS;
+
+        float V_cx = (cx_cur - cx_prev) / DeltaT;
+        float V_cy = (cy_cur - cy_prev) / DeltaT;
+        float V_w  = (w_cur  - w_prev)  / DeltaT;
+        float V_h  = (h_cur  - h_prev)  / DeltaT;
+
+        float pred_cx = cx_cur + V_cx * dt * scale_factor;
+        float pred_cy = cy_cur + V_cy * dt * scale_factor;
+        float pred_w  = std::max(1.f, w_cur + V_w * dt * scale_factor);
+        float pred_h  = std::max(1.f, h_cur + V_h * dt * scale_factor);
+
+        out_box.x = pred_cx - pred_w/2.f;
+        out_box.y = pred_cy - pred_h/2.f;
+        out_box.w = pred_w;
+        out_box.h = pred_h;
+        out_conf  = conf_cur;
+
+        return true;
+    }
+};
+
+/* ─── INTERNAL TRACKER (inference -> object matching) ────────────────────── */
+struct TrackedObject {
+    int         id;
+    int         cls_id;
+    cv::Scalar  color;
+    int         consecutive_missed;
+    int         age;
+    KinState    kin;
+    int         last_ai_frame_idx;
+    Box         last_box;
+    float       last_conf;
+};
+
 struct Tracker {
     std::vector<TrackedObject> objects;
     int    max_age;
     float  iou_threshold;
     pthread_mutex_t lock;
     int    next_id = 0;
-    int    frame_counter = 0;
 
     Tracker(int max_age_, float iou_thr)
         : max_age(max_age_), iou_threshold(iou_thr)
@@ -179,112 +340,104 @@ static float center_dist_norm(const Box &a, const Box &b) {
     return sqrtf(dx*dx+dy*dy) / avg;
 }
 
-static void update_velocity(TrackedObject &obj, const Box &nb,
-                             double t_cap, float alpha) {
-    double dt = t_cap - obj.t_capture;
-    if (dt < 1e-4) dt = 0.04;
-    float vx = (nb.x - obj.box_ia.x) / (float)dt;
-    float vy = (nb.y - obj.box_ia.y) / (float)dt;
-    float vw = (nb.w - obj.box_ia.w) / (float)dt;
-    float vh = (nb.h - obj.box_ia.h) / (float)dt;
-    obj.vx_ps = alpha*vx + (1-alpha)*obj.vx_ps;
-    obj.vy_ps = alpha*vy + (1-alpha)*obj.vy_ps;
-    obj.vw_ps = alpha*vw + (1-alpha)*obj.vw_ps;
-    obj.vh_ps = alpha*vh + (1-alpha)*obj.vh_ps;
-}
-
 static void tracker_update(Tracker &t,
                             const std::vector<Detection> &dets,
-                            double t_capture) {
+                            int frame_idx) {
     pthread_mutex_lock(&t.lock);
 
     std::vector<bool> matched(t.objects.size(), false);
-
     for (const auto &d : dets) {
-        int   best_obj   = -1;
+
+        int best_obj = -1;
         float best_score = -1.f;
 
         for (size_t oi = 0; oi < t.objects.size(); oi++) {
-            if (matched[oi] || t.objects[oi].cls_id != d.cls_id) continue;
-            const Box &ref = t.objects[oi].box_ia;
-            float iou   = iou_boxes(d.box, ref);
+
+            if (matched[oi] || t.objects[oi].cls_id != d.cls_id)
+                continue;
+
+            Box ref;
+            float tmp_conf;
+
+            if (!t.objects[oi].kin.predict(frame_idx, ref, tmp_conf)) {
+                ref = t.objects[oi].last_box;
+            }
+
+            float iou = iou_boxes(d.box, ref);
             float cdist = center_dist_norm(d.box, ref);
-            float score = iou * 2.f + std::max(0.f, 1.f - cdist);
-            if (score > best_score && iou >= t.iou_threshold) {
-                best_score = score; best_obj = (int)oi;
+
+            float score = 2.f * iou + 2.f * std::max(0.f, 1.f - cdist);
+
+            if (score > best_score && (iou > 0.05f || cdist < 1.2f)) {
+                best_score = score;
+                best_obj = oi;
             }
         }
 
         if (best_obj >= 0) {
             TrackedObject &obj = t.objects[best_obj];
-            update_velocity(obj, d.box, t_capture, 0.6f);
-            obj.box = obj.box_ia   = d.box;
-            obj.conf = obj.conf_ia = d.conf;
-            obj.t_capture  = t_capture;
-            obj.last_update = t_capture;
-            obj.frames_since_ia = 0;
+            obj.last_box = d.box;
+            obj.last_conf = d.conf;
+            obj.last_ai_frame_idx = frame_idx;
+            obj.consecutive_missed = 0;
             obj.age++;
+            obj.kin.push(d.box, d.conf, frame_idx);
             matched[best_obj] = true;
+
         } else if ((int)t.objects.size() < MAX_OBJECTS) {
             TrackedObject obj{};
             obj.id = ++t.next_id;
             obj.cls_id = d.cls_id;
-            obj.box = obj.box_ia = d.box;
-            obj.conf = obj.conf_ia = d.conf;
-            obj.t_capture = obj.last_update = t_capture;
-            obj.age = 1;
             obj.color = CLASS_COLORS[d.cls_id % 80];
+            obj.last_box = d.box;
+            obj.last_conf = d.conf;
+            obj.last_ai_frame_idx = frame_idx;
+            obj.age = 1;
+            obj.consecutive_missed = 0;
+            obj.kin.push(d.box, d.conf, frame_idx);
             t.objects.push_back(obj);
-            matched.push_back(false); /* pour les nouvellement ajoutés */
+            matched.push_back(false);
         }
     }
 
-    /* Incrémenter frames_since_ia pour les non mis-à-jour */
-    for (size_t oi = 0; oi < t.objects.size(); oi++)
-        if (!matched[oi] && t.objects[oi].frames_since_ia > 0)
-            t.objects[oi].frames_since_ia++;
+    for (size_t oi = 0; oi < t.objects.size(); oi++) {
+        if (!matched[oi]) {
+            t.objects[oi].consecutive_missed++;
+        }
+    }
 
-    /* Purger */
     t.objects.erase(
         std::remove_if(t.objects.begin(), t.objects.end(),
-            [&](const TrackedObject &o){
-                return o.frames_since_ia >= t.max_age || o.conf <= MC_MIN_CONF;
+            [&](const TrackedObject &o) {
+                return o.consecutive_missed >= t.max_age;
             }),
         t.objects.end());
 
     pthread_mutex_unlock(&t.lock);
 }
 
-static std::vector<Detection> tracker_predict(Tracker &t, double t_now) {
+/*
+ * No NMS on kinematic predictions: each tracked object produces at most
+ * one predicted box (one object = one TrackedObject = one kin.predict()
+ * call), so there are no duplicates to filter here.
+ */
+static std::vector<Detection> tracker_predict_kinematic(Tracker &t, int frame_idx_now) {
     pthread_mutex_lock(&t.lock);
-    t.frame_counter++;
     std::vector<Detection> result;
 
-    for (auto it = t.objects.begin(); it != t.objects.end(); ) {
-        double dt = t_now - it->t_capture;
-        if (dt > MC_MAX_PREDICT_MS / 1000.0) {
-            it = t.objects.erase(it); continue;
-        }
-        it->frames_since_ia++;
-        float x = it->box_ia.x + it->vx_ps * (float)dt;
-        float y = it->box_ia.y + it->vy_ps * (float)dt;
-        float w = std::max(1.f, it->box_ia.w + it->vw_ps * (float)dt);
-        float h = std::max(1.f, it->box_ia.h + it->vh_ps * (float)dt);
-        it->box = {x, y, w, h};
-        float conf = std::max(MC_MIN_CONF, it->conf_ia - MC_DECAY_CONF*(float)dt*25.f);
-        it->conf = conf;
-        result.push_back({{x, y, w, h}, conf, it->cls_id});
-        ++it;
-    }
+    for (auto &obj : t.objects) {
+        Box   pred_box;
+        float pred_conf;
+        if (!obj.kin.predict(frame_idx_now, pred_box, pred_conf)) continue;
 
-    if (result.size() >= 2)
-        nms_detections(result, NMS_THRESHOLD);
+        result.push_back({pred_box, pred_conf, obj.cls_id});
+    }
 
     pthread_mutex_unlock(&t.lock);
     return result;
 }
 
-/* ─── INFÉRENCE OPENVINO ─────────────────────────────────────────────────── */
+/* ─── OPENVINO INFERENCE ─────────────────────────────────────────────────── */
 struct OVModel {
     ov_core_t              *core    = nullptr;
     ov_model_t             *model   = nullptr;
@@ -293,6 +446,7 @@ struct OVModel {
     pthread_mutex_t         lock;
     int    count  = 0;
     double sum_ms = 0.0;
+    double last_ms = 0.0;
 
     OVModel() { pthread_mutex_init(&lock, NULL); }
     ~OVModel() { pthread_mutex_destroy(&lock); }
@@ -305,7 +459,7 @@ static bool ov_init(OVModel &m, const char *model_path) {
     if (ov_core_read_model(m.core, model_path, NULL, &m.model) != OK) {
         fprintf(stderr, "[OV] read_model failed: %s\n", model_path); return false;
     }
-    /* Choisir GPU si disponible */
+
     const char *device = "CPU";
     ov_available_devices_t devs;
     if (ov_core_get_available_devices(m.core, &devs) == OK) {
@@ -314,6 +468,23 @@ static bool ov_init(OVModel &m, const char *model_path) {
         ov_available_devices_free(&devs);
     }
     printf("  Device selected : %s\n", device);
+
+    /* Limit the number of threads the CPU plugin uses for inference. On a
+     * Pi4 (4 cores), reserve 2 for inference and leave 2 for the
+     * capture/encode/display threads. CPU-only, no effect on GPU. */
+    if (strcmp(device, "CPU") == 0) {
+        ov_status_e st = ov_core_set_property(
+            m.core, "CPU",
+            "INFERENCE_NUM_THREADS", "2",
+            nullptr);  // required terminator
+        if (st != OK) {
+            fprintf(stderr,
+                "[OV] Warning: could not limit INFERENCE_NUM_THREADS "
+                "(code %d) — inference will use all cores by default.\n",
+                (int)st);
+        }
+    }
+
     if (ov_core_compile_model(m.core, m.model, device, 0, &m.compiled) != OK) {
         fprintf(stderr, "[OV] compile_model failed\n"); return false;
     }
@@ -330,22 +501,37 @@ static void ov_free(OVModel &m) {
     if (m.core)     ov_core_free(m.core);
 }
 
-static std::vector<Detection> ov_infer(OVModel &m, const cv::Mat &frame) {
-    int fw = frame.cols, fh = frame.rows;
+/*
+ * ov_infer takes an image already resized to INPUT_SIZE x INPUT_SIZE
+ * (done once by the producer, see the main loop).
+ *
+ * orig_w / orig_h are the ORIGINAL frame dimensions (before the producer's
+ * resize), needed to rescale detected boxes back to display coordinates.
+ *
+ * rgb/tensor are thread_local: since this function is only called from the
+ * inference thread, they are allocated once and reused across calls.
+ */
+static std::vector<Detection> ov_infer(OVModel &m, const cv::Mat &small_bgr,
+                                        int orig_w, int orig_h, double* out_ms) {
+    thread_local cv::Mat rgb;
+    thread_local std::vector<float> tensor(3 * INPUT_SIZE * INPUT_SIZE);
 
-    /* Resize + BGR→RGB + float32 normalisé, layout NCHW */
-    cv::Mat small;
-    cv::resize(frame, small, cv::Size(INPUT_SIZE, INPUT_SIZE));
-    cv::Mat rgb;
-    cv::cvtColor(small, rgb, cv::COLOR_BGR2RGB);
+    cv::cvtColor(small_bgr, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0/255.0);
 
-    std::vector<float> tensor(3 * INPUT_SIZE * INPUT_SIZE);
-    for (int c = 0; c < 3; c++)
-        for (int r = 0; r < INPUT_SIZE; r++)
-            for (int col = 0; col < INPUT_SIZE; col++)
-                tensor[c*INPUT_SIZE*INPUT_SIZE + r*INPUT_SIZE + col] =
-                    rgb.at<cv::Vec3f>(r, col)[c];
+    /* Row-by-row pointer access instead of .at<>() (faster) */
+    for (int r = 0; r < INPUT_SIZE; r++) {
+        const cv::Vec3f *row = rgb.ptr<cv::Vec3f>(r);
+        float *pr = tensor.data() + 0*INPUT_SIZE*INPUT_SIZE + r*INPUT_SIZE;
+        float *pg = tensor.data() + 1*INPUT_SIZE*INPUT_SIZE + r*INPUT_SIZE;
+        float *pb = tensor.data() + 2*INPUT_SIZE*INPUT_SIZE + r*INPUT_SIZE;
+        for (int col = 0; col < INPUT_SIZE; col++) {
+            const cv::Vec3f &px = row[col];
+            pr[col] = px[0];
+            pg[col] = px[1];
+            pb[col] = px[2];
+        }
+    }
 
     int64_t shape[] = {1, 3, (int64_t)INPUT_SIZE, (int64_t)INPUT_SIZE};
     ov_shape_t ov_shape = {4, shape};
@@ -360,10 +546,11 @@ static std::vector<Detection> ov_infer(OVModel &m, const cv::Mat &frame) {
     ov_tensor_free(ov_t);
 
     pthread_mutex_lock(&m.lock);
-    m.count++; m.sum_ms += ms;
+    m.count++; m.sum_ms += ms; m.last_ms = ms;
     pthread_mutex_unlock(&m.lock);
 
-    /* Récupérer la sortie : shape [1, 84, n_anchors] */
+    if (out_ms) *out_ms = ms;
+
     ov_tensor_t *out_t = nullptr;
     ov_infer_request_get_output_tensor(m.req, &out_t);
     void *raw = nullptr;
@@ -374,14 +561,13 @@ static std::vector<Detection> ov_infer(OVModel &m, const cv::Mat &frame) {
     ov_tensor_get_shape(out_t, &out_shape);
     int n_anchors = (int)out_shape.dims[2];
 
-    float xs = (float)fw / INPUT_SIZE;
-    float ys = (float)fh / INPUT_SIZE;
+    float xs = (float)orig_w / INPUT_SIZE;
+    float ys = (float)orig_h / INPUT_SIZE;
 
     std::vector<Detection> raw_dets;
     raw_dets.reserve(64);
 
     for (int i = 0; i < n_anchors; i++) {
-        /* Layout [row * n_anchors + col] */
         int   best_cls  = 0;
         float best_conf = preds[4 * n_anchors + i];
         for (int k = 1; k < 80; k++) {
@@ -400,39 +586,38 @@ static std::vector<Detection> ov_infer(OVModel &m, const cv::Mat &frame) {
     return raw_dets;
 }
 
-/* ─── DESSIN ─────────────────────────────────────────────────────────────── */
 static void draw_detections(cv::Mat &frame, const std::vector<Detection> &dets) {
     for (const auto &d : dets) {
         int x = (int)d.box.x, y = (int)d.box.y;
         int w = (int)d.box.w, h = (int)d.box.h;
         cv::Scalar color = CLASS_COLORS[d.cls_id % 80];
-        cv::rectangle(frame, cv::Rect(x, y, w, h), color, 2, cv::LINE_AA);
+        cv::rectangle(frame, cv::Rect(x, y, w, h), color, 2, cv::LINE_8);
 
         char label[80];
         snprintf(label, sizeof(label), "%s: %.0f%%",
                  COCO_CLASSES[d.cls_id % 80], d.conf * 100.f);
 
         int baseline = 0;
-        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
-                                      0.55, 1, &baseline);
+        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_PLAIN,
+                                      1.1, 1, &baseline);
         int ly = std::max(y - 4, ts.height + 4);
         cv::rectangle(frame,
                       cv::Point(x, ly - ts.height - baseline - 4),
                       cv::Point(x + ts.width + 4, ly),
                       color, cv::FILLED);
         cv::putText(frame, label, cv::Point(x+2, ly-baseline-2),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                    cv::Scalar(255,255,255), 1, cv::LINE_AA);
+                    cv::FONT_HERSHEY_PLAIN, 1.1,
+                    cv::Scalar(255,255,255), 1, cv::LINE_8);
     }
 }
 
-/* ─── JPEG PARTAGÉ ───────────────────────────────────────────────────────── */
+/* ─── SHARED JPEG BUFFER ─────────────────────────────────────────────────── */
 static pthread_mutex_t  g_jpeg_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_jpeg_cond = PTHREAD_COND_INITIALIZER;
 static std::vector<uint8_t> g_jpeg_buf;
-static int              g_jpeg_seq  = 0;
+static std::atomic<int> g_jpeg_seq{0};
 
-/* ─── SERVEUR MJPEG ──────────────────────────────────────────────────────── */
+/* ─── MJPEG SERVER ────────────────────────────────────────────────────────── */
 static volatile sig_atomic_t g_stop = 0;
 
 struct ClientArg { int fd; };
@@ -470,15 +655,17 @@ static void *client_thread(void *arg) {
             std::vector<uint8_t> jpg_copy;
 
             pthread_mutex_lock(&g_jpeg_lock);
-            if (g_jpeg_seq == last_sent) {
+            int cur_seq = g_jpeg_seq.load(std::memory_order_relaxed);
+            if (cur_seq == last_sent) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_sec += 1;
                 pthread_cond_timedwait(&g_jpeg_cond, &g_jpeg_lock, &ts);
+                cur_seq = g_jpeg_seq.load(std::memory_order_relaxed);
             }
-            if (!g_jpeg_buf.empty() && g_jpeg_seq != last_sent) {
+            if (!g_jpeg_buf.empty() && cur_seq != last_sent) {
                 jpg_copy   = g_jpeg_buf;
-                last_sent  = g_jpeg_seq;
+                last_sent  = cur_seq;
             }
             pthread_mutex_unlock(&g_jpeg_lock);
 
@@ -529,8 +716,18 @@ static void *http_server_thread(void *arg) {
     return NULL;
 }
 
-/* ─── THREAD IA ──────────────────────────────────────────────────────────── */
-struct AIItem { cv::Mat frame; double t_capture; };
+/* ─── INFERENCE THREAD ───────────────────────────────────────────────────── */
+/*
+ * AIItem carries an image already resized to INPUT_SIZE x INPUT_SIZE
+ * (small_bgr), moved from a fresh local Mat in the main thread — no
+ * copy/clone needed.
+ */
+struct AIItem {
+    cv::Mat small_bgr;
+    int     frame_idx;
+    int     orig_w;
+    int     orig_h;
+};
 
 struct AIQueue {
     AIItem          slot;
@@ -549,10 +746,11 @@ struct AIQueue {
 };
 
 struct AIThreadArg {
-    AIQueue  *ai_q;
-    OVModel  *ov;
-    Tracker  *tracker;
-    bool      running;
+    AIQueue       *ai_q;
+    OVModel       *ov;
+    Tracker       *tracker;
+    AdaptiveSkip  *skip;
+    bool           running;
 };
 
 static void *ai_thread_fn(void *arg) {
@@ -578,21 +776,27 @@ static void *ai_thread_fn(void *arg) {
 
         if (!got) continue;
 
-        std::vector<Detection> dets = ov_infer(*a->ov, item.frame);
+        double infer_ms = 0;
+        std::vector<Detection> dets = ov_infer(*a->ov, item.small_bgr,
+                                                item.orig_w, item.orig_h,
+                                                &infer_ms);
 
-        /* Mise à l'échelle display avant le tracker */
+        a->skip->update(infer_ms);
+
+        /* No-op while DISPLAY_SCALE == 1.0f; kept for when display
+         * resizing is reintroduced. */
         if (DISPLAY_SCALE != 1.0f)
             for (auto &d : dets) {
                 d.box.x *= DISPLAY_SCALE; d.box.y *= DISPLAY_SCALE;
                 d.box.w *= DISPLAY_SCALE; d.box.h *= DISPLAY_SCALE;
             }
 
-        tracker_update(*a->tracker, dets, item.t_capture);
+        tracker_update(*a->tracker, dets, item.frame_idx);
     }
     return NULL;
 }
 
-/* ─── THREAD ENCODAGE JPEG ───────────────────────────────────────────────── */
+/* ─── JPEG ENCODE THREAD ─────────────────────────────────────────────────── */
 struct EncodeSlot {
     cv::Mat         frame;
     bool            has_frame = false;
@@ -602,10 +806,8 @@ struct EncodeSlot {
 };
 
 struct EncodeThreadArg {
-    EncodeSlot      *slot;
-    cv::VideoWriter *writer;
-    pthread_mutex_t  writer_lock;
-    bool             running;
+    EncodeSlot *slot;
+    bool        running;
 };
 
 static void *encode_thread_fn(void *arg) {
@@ -627,19 +829,23 @@ static void *encode_thread_fn(void *arg) {
 
         if (!got) { usleep(5000); continue; }
 
-        cv::imencode(".jpg", frame, jpeg_buf, params);
+        if (frame.empty()) {
+            usleep(5000);
+            continue;
+        }
+
+        try {
+            cv::imencode(".jpg", frame, jpeg_buf, params);
+        }
+        catch (...) {
+            continue;
+        }
 
         pthread_mutex_lock(&g_jpeg_lock);
         g_jpeg_buf = jpeg_buf;
-        g_jpeg_seq++;
+        g_jpeg_seq.fetch_add(1, std::memory_order_relaxed);
         pthread_cond_broadcast(&g_jpeg_cond);
         pthread_mutex_unlock(&g_jpeg_lock);
-
-        if (a->writer && a->writer->isOpened()) {
-            pthread_mutex_lock(&a->writer_lock);
-            a->writer->write(frame);
-            pthread_mutex_unlock(&a->writer_lock);
-        }
     }
     return NULL;
 }
@@ -650,52 +856,100 @@ static void handle_sigint(int) {
     pthread_cond_broadcast(&g_jpeg_cond);
 }
 
-/* ─── PIPELINE PRINCIPAL ─────────────────────────────────────────────────── */
+#if ENABLE_PROFILING
+/* Simple accumulators, printed every ~5s to stderr so as not to pollute
+ * stdout (progress bar). */
+struct ProfAccum {
+    double capture = 0, resize_enqueue = 0, predict = 0, draw = 0, enqueue_jpeg = 0;
+    int    n = 0;
+
+    void add(double a, double b, double c, double d, double e) {
+        capture += a; resize_enqueue += b; predict += c; draw += d; enqueue_jpeg += e;
+        n++;
+    }
+
+    void maybe_print(int period) {
+        if (n < period) return;
+        fprintf(stderr,
+            "[profile] capture=%.2fms  resize+ai_enqueue=%.2fms  predict=%.2fms  "
+            "draw=%.2fms  enqueue_jpeg=%.2fms  (avg over %d frames)\n",
+            1000.0*capture/n, 1000.0*resize_enqueue/n, 1000.0*predict/n,
+            1000.0*draw/n, 1000.0*enqueue_jpeg/n, n);
+        capture = resize_enqueue = predict = draw = enqueue_jpeg = 0;
+        n = 0;
+    }
+};
+#endif
+
+/* ─── MAIN PIPELINE ───────────────────────────────────────────────────────── */
 static bool run_pipeline(const char *video_path, const char *model_path) {
     init_colors();
     signal(SIGINT, handle_sigint);
 
-    cv::VideoCapture cap(video_path);
+    char pipeline[1024];
+    bool is_camera = strncmp(video_path, "/dev/video30", 10) == 0;
+
+    if (is_camera) {
+        snprintf(pipeline, sizeof(pipeline),
+        "v4l2src device=%s ! "
+        "queue max-size-buffers=3 leaky=downstream ! "
+        "videoscale ! "
+        "video/x-raw,width=640,height=360 ! "
+        "videoconvert ! "
+        "video/x-raw,format=BGR ! "
+        "appsink sync=false drop=true max-buffers=1",
+        video_path);
+    } else {
+        snprintf(pipeline, sizeof(pipeline),
+        "filesrc location=%s ! "
+        "queue max-size-buffers=3 leaky=downstream ! "
+        "decodebin ! "
+        "queue max-size-buffers=3 leaky=downstream ! "
+        "videoscale ! "
+        "video/x-raw,width=640,height=360 ! "
+        "videoconvert ! "
+        "video/x-raw,format=BGR ! "
+        "appsink sync=false drop=true",
+        video_path);
+    }
+
+    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
-        fprintf(stderr, "[ERREUR] Impossible d'ouvrir : %s\n", video_path);
+        fprintf(stderr, "[ERROR] Could not open: %s\n", video_path);
         return false;
     }
     int    width  = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
     int    height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
     double fps    = cap.get(cv::CAP_PROP_FPS);
     int    total  = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
-    int    disp_w = (int)(width  * DISPLAY_SCALE);
-    int    disp_h = (int)(height * DISPLAY_SCALE);
+    int    disp_w = width;
+    int    disp_h = height;
+    double source_duration = (total > 0 && fps > 0) ? total / fps : 0.0;
 
     printf("================================================\n");
-    printf("  YOLO — MJPEG Stream (Forward Temporal Pred.)\n");
+    printf("  YOLO — MJPEG Stream (Kinematic Predictor) — OPTIMIZED\n");
     printf("================================================\n");
     printf("  Input   : %s\n", video_path);
-    printf("  Source  : %dx%d @ %.1ffps (%d frames)\n", width, height, fps, total);
-    printf("  Display : %dx%d (scale %.2f)\n", disp_w, disp_h, DISPLAY_SCALE);
-    printf("  Chargement modèle ONNX...\n");
+    printf("  Source  : %dx%d @ %.1ffps (%d frames, %.1fs)\n",
+           width, height, fps, total, source_duration);
+    printf("  Display : %dx%d @ %.1ffps (FIXED, no resize)\n", disp_w, disp_h, DISPLAY_FPS);
+    printf("  Predictor : pure frame-by-frame kinematic\n");
+    printf("  Loading ONNX model...\n");
 
     OVModel ov;
     if (!ov_init(ov, model_path)) return false;
-
-    Tracker tracker(5, MC_IOU_MATCH);
-
-    cv::VideoWriter writer(RECORD_OUTPUT,
-                           cv::VideoWriter::fourcc('m','p','4','v'),
-                           RECORD_FPS, cv::Size(disp_w, disp_h));
+    
+    Tracker tracker(TRACKER_MAX_AGE, MC_IOU_MATCH);
 
     AIQueue    ai_q;
     EncodeSlot enc_slot;
+    AdaptiveSkip skip_controller;
 
-    AIThreadArg ai_arg { &ai_q, &ov, &tracker, true };
+    AIThreadArg ai_arg { &ai_q, &ov, &tracker, &skip_controller, true };
     pthread_t t_ai;
     pthread_create(&t_ai, NULL, ai_thread_fn, &ai_arg);
 
-    EncodeThreadArg enc_arg;
-    enc_arg.slot    = &enc_slot;
-    enc_arg.writer  = &writer;
-    enc_arg.running = true;
-    pthread_mutex_init(&enc_arg.writer_lock, NULL);
+    EncodeThreadArg enc_arg { &enc_slot, true };
     pthread_t t_enc;
     pthread_create(&t_enc, NULL, encode_thread_fn, &enc_arg);
 
@@ -705,49 +959,128 @@ static bool run_pipeline(const char *video_path, const char *model_path) {
     pthread_create(&t_http, NULL, http_server_thread, port_ptr);
     pthread_detach(t_http);
 
-    printf("  Serveur MJPEG démarré sur le port %d\n", HTTP_PORT);
-    printf("  Démarrage...\n\n");
+    printf("  MJPEG server started on port %d\n", HTTP_PORT);
+    printf("  Waiting for 2 inference results before drawing boxes...\n\n");
 
-    int    displayed = 0, ai_skipped = 0;
-    double t_start   = perf_counter();
+    int    displayed = 0, ai_processed = 0;
+    double t_program_start = perf_counter();
     int    frame_idx = 0;
     double last_disp_t = 0.0, disp_fps = 0.0;
     double disp_fps_acc = 0.0; int disp_fps_n = 0;
+    double t_real_start = perf_counter();
+
+#if ENABLE_PROFILING
+    ProfAccum prof;
+    const int PROF_PERIOD = (int)(DISPLAY_FPS * 5); // ~5s
+#endif
 
     while (!g_stop) {
+#if ENABLE_PROFILING
+        double tp0 = perf_counter();
+#endif
         cv::Mat raw;
         cap >> raw;
-        double t_capture = perf_counter();
-        if (raw.empty()) break;
-        cv::Mat dummy; cap >> dummy; /* skip frame */
 
-        /* Envoyer au thread IA */
-        pthread_mutex_lock(&ai_q.lock);
-        if (ai_q.has_item) { ai_skipped++; }
-        ai_q.slot = { raw.clone(), t_capture };
-        ai_q.has_item = true;
-        pthread_cond_signal(&ai_q.cond_consumer);
-        pthread_mutex_unlock(&ai_q.lock);
+        double actual_fps = disp_fps > 1.0 ? disp_fps : DISPLAY_FPS;
 
-        /* Frame d'affichage */
-        cv::Mat disp;
-        cv::resize(raw, disp, cv::Size(disp_w, disp_h));
-
-        /* Forward temporal prediction */
-        std::vector<Detection> pred_dets;
-        if (MC_ENABLED) {
-            double t_now = perf_counter();
-            pred_dets = tracker_predict(tracker, t_now);
+        if (actual_fps < DISPLAY_FPS * 0.95) {
+            int skip_frames = (int)(DISPLAY_FPS / actual_fps) - 1;
+            for (int i = 0; i < skip_frames; i++) {
+                cv::Mat dummy;
+                if (!cap.read(dummy)) break;
+                frame_idx++;
+            }
         }
+
+        /*
+         * BUGFIX: an empty frame from a video FILE means "end of file"
+         * (break is correct). From a CAMERA, an empty frame is a
+         * TRANSIENT GStreamer/v4l2 read error (e.g. "unable to query
+         * pipeline state" / "v4l2src0 reported: Failed to allocate a
+         * buffer") — not end of stream. In camera mode we now attempt
+         * to RECONNECT the pipeline instead of exiting the program.
+         */
+        if (raw.empty()) {
+            if (is_camera) {
+                fprintf(stderr,
+                    "\n[WARN] Camera read failed (empty frame) — "
+                    "attempting to reconnect the v4l2 pipeline...\n");
+                cap.release();
+
+                const int    MAX_RETRY      = 50;   // ~10s total
+                const double RETRY_DELAY_S  = 0.2;
+                bool reopened = false;
+                int  retry = 0;
+
+                while (!g_stop && retry < MAX_RETRY) {
+                    sleep_sec(RETRY_DELAY_S);
+                    cap.open(pipeline, cv::CAP_GSTREAMER);
+                    if (cap.isOpened()) { reopened = true; break; }
+                    retry++;
+                }
+
+                if (!reopened) {
+                    fprintf(stderr,
+                        "[ERROR] Camera reconnection failed after %d "
+                        "attempts — stopping pipeline.\n", MAX_RETRY);
+                    break;
+                }
+
+                fprintf(stderr,
+                    "[INFO] Camera pipeline reconnected after %d attempt(s).\n",
+                    retry);
+                continue;
+            } else {
+                /* Video file: normal end of stream. */
+                break;
+            }
+        }
+
+        frame_idx++; // display frame number (1, 2, 3, ...)
+
+#if ENABLE_PROFILING
+        double tp1 = perf_counter();
+#endif
+
+        bool do_ai = skip_controller.should_process();
+        if (do_ai) {
+            cv::Mat small;
+            cv::resize(raw, small, cv::Size(INPUT_SIZE, INPUT_SIZE));
+
+            pthread_mutex_lock(&ai_q.lock);
+            ai_q.slot = { std::move(small), frame_idx, raw.cols, raw.rows };
+            ai_q.has_item = true;
+            pthread_cond_signal(&ai_q.cond_consumer);
+            pthread_mutex_unlock(&ai_q.lock);
+            ai_processed++;
+        }
+
+#if ENABLE_PROFILING
+        double tp2 = perf_counter();
+#endif
+
+        cv::Mat disp = raw.clone();
+
+        std::vector<Detection> pred_dets =
+            tracker_predict_kinematic(tracker, frame_idx);
+
+#if ENABLE_PROFILING
+        double tp3 = perf_counter();
+#endif
+
         draw_detections(disp, pred_dets);
 
-        /* OSD */
-        double now = perf_counter();
+#if ENABLE_PROFILING
+        double tp4 = perf_counter();
+#endif
+
+        /* ─── OSD ─── */
+        double t_now = perf_counter();
         if (last_disp_t > 0.0) {
-            double dt = now - last_disp_t;
-            if (dt > 1e-9) { disp_fps_acc += 1.0/dt; disp_fps_n++; }
+            double dt_disp = t_now - last_disp_t;
+            if (dt_disp > 1e-9) { disp_fps_acc += 1.0/dt_disp; disp_fps_n++; }
         }
-        last_disp_t = now;
+        last_disp_t = t_now;
         if (disp_fps_n > 0) disp_fps = disp_fps_acc / disp_fps_n;
 
         double ai_fps = 0.0;
@@ -755,49 +1088,62 @@ static bool run_pipeline(const char *video_path, const char *model_path) {
         if (ov.count > 0) ai_fps = ov.count / (ov.sum_ms / 1000.0);
         pthread_mutex_unlock(&ov.lock);
 
-        int n_tracked = 0, n_predicted_mc = 0;
+        int n_tracked = 0, n_predictable = 0;
         pthread_mutex_lock(&tracker.lock);
         n_tracked = (int)tracker.objects.size();
-        for (auto &o : tracker.objects)
-            if ((now - o.t_capture) > 0.02) n_predicted_mc++;
+        for (auto &o : tracker.objects) {
+            if (o.kin.has_two) n_predictable++;
+        }
         pthread_mutex_unlock(&tracker.lock);
+
+        int current_skip = skip_controller.get_skip();
 
         char osd[256];
         snprintf(osd, sizeof(osd),
-                 "Disp:%.1ffps  AI:%.1ffps  F:%d  skip:%d  MC:%d(%dP)",
-                 disp_fps, ai_fps, displayed, ai_skipped,
-                 n_tracked, n_predicted_mc);
+                 "Disp:%.1ffps  AI:%.1ffps  skip:%d  Obj:%d(%dP)",
+                 disp_fps, ai_fps, current_skip,
+                 n_tracked, n_predictable);
         cv::putText(disp, osd, cv::Point(10,28), cv::FONT_HERSHEY_SIMPLEX,
-                    0.6, cv::Scalar(0,0,0), 3, cv::LINE_AA);
+                    0.6, cv::Scalar(0,0,0), 3, cv::LINE_8);
         cv::putText(disp, osd, cv::Point(10,28), cv::FONT_HERSHEY_SIMPLEX,
-                    0.6, cv::Scalar(0,220,80), 2, cv::LINE_AA);
+                    0.6, cv::Scalar(0,220,80), 2, cv::LINE_8);
 
-        /* Envoyer à l'encodeur */
+        /* ─── SEND TO JPEG ENCODER ─── */
         pthread_mutex_lock(&enc_slot.lock);
-        enc_slot.frame     = disp;
+        enc_slot.frame = disp;
         enc_slot.has_frame = true;
         pthread_mutex_unlock(&enc_slot.lock);
 
         displayed++;
 
-        float pct = (float)displayed / (float)(total/2 > 0 ? total/2 : 1) * 100.f;
+#if ENABLE_PROFILING
+        double tp5 = perf_counter();
+        prof.add(tp1-tp0, tp2-tp1, tp3-tp2, tp4-tp3, tp5-tp4);
+        prof.maybe_print(PROF_PERIOD);
+#endif
+
+        /* ─── PROGRESS BAR ─── */
+        float pct = (total > 0) ? (100.f * frame_idx / total) : 0.f;
         int bar_n = (int)(25 * pct / 100);
         char bar[27] = {};
         for (int i=0; i<25; i++) bar[i] = i < bar_n ? '#' : '-';
-        printf("\r  [%s] %5.1f%%  Disp:%5.1ffps  AI:%5.1ffps  skip:%3d  MC:%d(%dP)",
-               bar, (double)pct, disp_fps, ai_fps, ai_skipped,
-               n_tracked, n_predicted_mc);
+        printf("\r  [%s] %5.1f%%  F:%d  skip:%d  Disp:%5.1ffps  AI:%5.1ffps  Obj:%d(%dP)",
+               bar, (double)pct, frame_idx, current_skip,
+               disp_fps, ai_fps, n_tracked, n_predictable);
         fflush(stdout);
 
-        /* Timing framerate */
-        frame_idx++;
-        double target  = t_start + frame_idx * (2.0 / fps);
-        double sleep_t = target - perf_counter();
-        if (sleep_t < -0.04) { t_start += 0.02; sleep_t = target - perf_counter(); }
-        if (sleep_t > 0.0) sleep_sec(sleep_t);
+        /* ─── FIXED-FPS SYNC ─── */
+        double next_display_time = t_program_start + displayed / DISPLAY_FPS;
+        double sleep_t = next_display_time - perf_counter();
+
+        if (sleep_t > 0.0) {
+            sleep_sec(sleep_t);
+        } else if (sleep_t < -0.1) {
+            t_program_start += 0.05;
+        }
     }
 
-    printf("\n\n  Finalisation...\n");
+    printf("\n\n  Finishing up...\n");
     g_stop = 1;
     ai_arg.running = enc_arg.running = false;
     pthread_cond_broadcast(&ai_q.cond_consumer);
@@ -807,15 +1153,18 @@ static bool run_pipeline(const char *video_path, const char *model_path) {
     pthread_join(t_enc, NULL);
 
     cap.release();
-    writer.release();
     ov_free(ov);
-    pthread_mutex_destroy(&enc_arg.writer_lock);
 
-    double elapsed = perf_counter() - t_start;
-    printf("  Frames affichées : %d\n", displayed);
-    printf("  Skip IA          : %d\n", ai_skipped);
-    printf("  FPS affiché moy. : %.1f\n", displayed / elapsed);
-    printf("  Terminé !\n");
+    double elapsed = perf_counter() - t_real_start;
+    printf("  Frames read      : %d\n", frame_idx);
+    printf("  Frames displayed : %d\n", displayed);
+    printf("  Frames inferred  : %d\n", ai_processed);
+    printf("  Elapsed time     : %.1fs\n", elapsed);
+    double real_source_duration = (frame_idx > 0 && fps > 0) ? frame_idx / fps : 0.0;
+
+    printf("  Source duration  : %.1fs\n", real_source_duration);
+    printf("  Avg display FPS  : %.1f\n", displayed / elapsed);
+    printf("  Done!\n");
     return true;
 }
 
