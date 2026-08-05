@@ -1,9 +1,77 @@
-# Modèles YOLO (PyTorch, ONNX, OpenVINO)
+# ============================================
+# YOLO / AI Models
+# ============================================
 *.onnx
 *.pt
-*_openvino_model/
-*.mp4
-*.png
+*.pth
+*.bin
+*.xml
+*.engine
+*.ort
+*.tflite
+*.pb
+*.weights
 
-# Dossier de compilation C++ / GStreamer
-gst-template/   
+# NCNN
+*_ncnn_model/
+
+# ============================================
+# Videos
+# ============================================
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Images générées
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ============================================
+# Logs
+# ============================================
+*.log
+
+# ============================================
+# Build
+# ============================================
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+Makefile.old
+*.o
+*.a
+*.so
+
+# Executables
+yolo_pipeline
+yolo_pipeline_bee
+
+# ============================================
+# VSCode / IDE
+# ============================================
+.vscode/
+.idea/
+
+# ============================================
+# OS
+# ============================================
+.DS_Store
+Thumbs.db
