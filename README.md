@@ -62,11 +62,13 @@ g++ -O3 -std=c++17 yolo_detection_stream.cpp -o yolo_detection_stream \
 
 ## Project Structure
 
+```
 onnx_detection_pipeline/
-├── yolo_detection_stream.cpp # main program (C++)
-├── yolo11n_256.onnx # YOLO model (git-ignored)
-├── test-video.mp4 # test video (git-ignored)
+├── yolo_detection_stream.cpp     # main program (C++)
+├── yolo11n_256.onnx              # YOLO model (git-ignored)
+├── test-video.mp4                # test video (git-ignored)
 └── README.md
+```
 
 
 ---
